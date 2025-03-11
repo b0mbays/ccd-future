@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_interval, async_track_point_in_time
 from homeassistant.util import dt as dt_util
 from .const import DOMAIN
+from .const import CONF_SWITCH_ENTITY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -328,17 +329,21 @@ async def async_get_device_ip(self, device_name):
             # Complex case: time window spans midnight
             return now >= start_time or now <= end_time
 
-    async def async_check_switch_entity(self):
-        """Check if the switch entity is enabled (if configured)."""
-        if not self.switch_entity_id:
-            return True  # No switch configured, always enabled
-        
-        state = self.hass.states.get(self.switch_entity_id)
-        if state is None:
-            _LOGGER.warning(f"Switch entity {self.switch_entity_id} not found")
-            return True  # If entity doesn't exist, default to enabled
-        
-        return state.state == 'on'
+    async def async_check_switch_entity(self) -> bool:
+        """Check if the switch entity exists in Home Assistant."""
+        try:
+            # Get state of the switch entity
+            state = self.hass.states.get(self.config_entry.options.get(CONF_SWITCH_ENTITY, ""))
+            
+            # If state is None, the entity doesn't exist
+            if state is None:
+                _LOGGER.warning(f"Switch entity {self.config_entry.options.get(CONF_SWITCH_ENTITY, '')} does not exist")
+                return False
+                
+            return True
+        except Exception as e:
+            _LOGGER.error(f"Error checking switch entity: {e}")
+            return False
 
     async def async_monitor_devices(self, *args):
         """Monitor all devices and reconnect if needed."""
