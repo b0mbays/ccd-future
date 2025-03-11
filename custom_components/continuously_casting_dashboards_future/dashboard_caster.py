@@ -252,12 +252,18 @@ class ContinuouslyCastingDashboardsFuture:
         # Otherwise, scan for devices
         try:
             _LOGGER.info(f"Scanning for device: {device_name}")
-            process = await asyncio.create_subprocess_exec(
-                'catt', 'scan', '--timeout', '10',  # Longer timeout
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
+            
+            # Create a coroutine for the scan process
+            async def run_scan():
+                process = await asyncio.create_subprocess_exec(
+                    'catt', 'scan',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                return await process.communicate()
+            
+            # Run the scan with a timeout
+            stdout, stderr = await asyncio.wait_for(run_scan(), timeout=10)
             
             scan_output = stdout.decode()
             _LOGGER.info(f"Full scan output: {scan_output}")
