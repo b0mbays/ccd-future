@@ -12,7 +12,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_interval, async_track_point_in_time
 from homeassistant.util import dt as dt_util
 from .const import DOMAIN
-from .const import CONF_SWITCH_ENTITY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -231,79 +230,83 @@ class ContinuouslyCastingDashboardsFuture:
             _LOGGER.error(f"Error checking device status at {ip}: {str(e)}")
             return False
 
-   async def async_get_device_ip(self, device_name):
-    """Get IP address for a device name using catt scan or a cached mapping."""
-    # First check if we have a cached mapping
-    device_map_file = '/config/continuously_casting_dashboards/device_map.json'
-    device_map = {}
-    
-    if os.path.exists(device_map_file):
+    async def async_get_device_ip(self, device_name):
+        """Get IP address for a device name using catt scan or a cached mapping."""
+        # First check if we have a cached mapping
+        device_map_file = '/config/continuously_casting_dashboards/device_map.json'
+        device_map = {}
+        
+        if os.path.exists(device_map_file):
+            try:
+                # Use async_add_executor_job for file reading
+                def read_map_file():
+                    with open(device_map_file, 'r') as f:
+                        return json.load(f)
+                        
+                device_map = await self.hass.async_add_executor_job(read_map_file)
+            except Exception as e:
+                _LOGGER.warning(f"Failed to load device map: {str(e)}")
+        
+        # If we have a cached IP for this device, use it
+        if device_name in device_map and device_map[device_name]:
+            _LOGGER.debug(f"Using cached IP {device_map[device_name]} for {device_name}")
+            return device_map[device_name]
+        
+        # Otherwise, scan for devices
         try:
-            with open(device_map_file, 'r') as f:
-                device_map = json.load(f)
-        except Exception as e:
-            _LOGGER.warning(f"Failed to load device map: {str(e)}")
-    
-    # If we have a cached IP for this device, use it
-    if device_name in device_map and device_map[device_name]:
-        _LOGGER.debug(f"Using cached IP {device_map[device_name]} for {device_name}")
-        return device_map[device_name]
-    
-    # Otherwise, scan for devices
-    try:
-        _LOGGER.info(f"Scanning for device: {device_name}")
-        process = await asyncio.create_subprocess_exec(
-            'catt', 'scan',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        
-        scan_output = stdout.decode()
-        _LOGGER.info(f"Full scan output: {scan_output}")
-        
-        if process.returncode != 0:
-            _LOGGER.error(f"Catt scan failed: {stderr.decode().strip()}")
+            _LOGGER.info(f"Scanning for device: {device_name}")
+            process = await asyncio.create_subprocess_exec(
+                'catt', 'scan',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            scan_output = stdout.decode()
+            _LOGGER.info(f"Full scan output: {scan_output}")
+            
+            if process.returncode != 0:
+                _LOGGER.error(f"Catt scan failed: {stderr.decode().strip()}")
+                return None
+            
+            # Parse scan results
+            for line in scan_output.splitlines():
+                # Skip the header line or empty lines
+                if "Scanning Chromecasts..." in line or not line.strip():
+                    continue
+                
+                # Parse format: "192.168.0.16 - Basement display - Google Inc. Google Nest Hub"
+                parts = line.split(' - ')
+                if len(parts) < 2:
+                    continue
+                    
+                ip = parts[0].strip()
+                found_name = parts[1].strip() if len(parts) > 1 else ""
+                
+                # Simple exact match - case sensitive for precision
+                if device_name == found_name:
+                    _LOGGER.info(f"Matched device '{device_name}' with IP {ip}")
+                    
+                    # Cache the mapping
+                    device_map[device_name] = ip
+                    try:
+                        # Use async_add_executor_job for file writing
+                        def write_map_file():
+                            os.makedirs('/config/continuously_casting_dashboards', exist_ok=True)
+                            with open(device_map_file, 'w') as f:
+                                json.dump(device_map, f, indent=2)
+                                
+                        await self.hass.async_add_executor_job(write_map_file)
+                    except Exception as e:
+                        _LOGGER.warning(f"Failed to save device map: {str(e)}")
+                    
+                    return ip
+            
+            _LOGGER.error(f"Device '{device_name}' not found in scan results. Make sure the name matches exactly what appears in the scan output.")
             return None
-        
-        # Parse scan results
-        for line in scan_output.splitlines():
-            # Skip the header line or empty lines
-            if "Scanning Chromecasts..." in line or not line.strip():
-                continue
-                
-            _LOGGER.debug(f"Processing scan line: {line}")
-            
-            # Parse format: "192.168.0.16 - Basement display - Google Inc. Google Nest Hub"
-            parts = line.split(' - ')
-            if len(parts) < 2:
-                continue
-                
-            ip = parts[0].strip()
-            found_name = parts[1].strip() if len(parts) > 1 else ""
-            
-            _LOGGER.debug(f"Found device: {found_name} with IP: {ip}")
-            
-            # Case-insensitive exact match or substring match as fallback
-            if device_name.lower() == found_name.lower() or device_name.lower() in found_name.lower():
-                _LOGGER.info(f"Matched device '{device_name}' to scan result '{found_name}' with IP {ip}")
-                
-                # Cache the mapping
-                device_map[device_name] = ip
-                try:
-                    os.makedirs('/config/continuously_casting_dashboards', exist_ok=True)
-                    with open(device_map_file, 'w') as f:
-                        json.dump(device_map, f, indent=2)
-                except Exception as e:
-                    _LOGGER.warning(f"Failed to save device map: {str(e)}")
-                
-                return ip
-        
-        _LOGGER.error(f"Device {device_name} not found in scan results")
-        return None
-    except Exception as e:
-        _LOGGER.error(f"Error scanning for devices: {str(e)}")
-        return None
+        except Exception as e:
+            _LOGGER.error(f"Error scanning for devices: {str(e)}")
+            return None
 
     async def async_is_within_time_window(self, device_name, device_config):
         """Check if current time is within the casting window for a device."""
@@ -329,31 +332,17 @@ class ContinuouslyCastingDashboardsFuture:
             # Complex case: time window spans midnight
             return now >= start_time or now <= end_time
 
-    async def async_check_switch_entity(self) -> bool:
-        """Check if the switch entity exists in Home Assistant and is turned on."""
-        try:
-            # Get state of the switch entity
-            switch_entity = self.switch_entity_id
-            
-            # If no switch entity is configured, just return True
-            if not switch_entity:
-                _LOGGER.debug("No switch entity configured, allowing casting")
-                return True
-                
-            state = self.hass.states.get(switch_entity)
-            
-            # If state is None, the entity doesn't exist
-            if state is None:
-                _LOGGER.warning(f"Switch entity {switch_entity} does not exist")
-                return False
-                
-            _LOGGER.debug(f"Switch entity {switch_entity} state: {state.state}")
-            
-            # Only allow casting if the switch is on
-            return state.state.lower() == "on"
-        except Exception as e:
-            _LOGGER.error(f"Error checking switch entity: {e}")
-            return False
+    async def async_check_switch_entity(self):
+        """Check if the switch entity is enabled (if configured)."""
+        if not self.switch_entity_id:
+            return True  # No switch configured, always enabled
+        
+        state = self.hass.states.get(self.switch_entity_id)
+        if state is None:
+            _LOGGER.warning(f"Switch entity {self.switch_entity_id} not found")
+            return True  # If entity doesn't exist, default to enabled
+        
+        return state.state == 'on'
 
     async def async_monitor_devices(self, *args):
         """Monitor all devices and reconnect if needed."""
@@ -486,17 +475,6 @@ class ContinuouslyCastingDashboardsFuture:
         # Save health stats to file
         await self.async_save_health_stats()
 
-    async def async_save_health_stats(self):
-        """Save health statistics to file."""
-        try:
-            stats_dir = '/config/continuously_casting_dashboards'
-            os.makedirs(stats_dir, exist_ok=True)
-            
-            with open(f'{stats_dir}/health_stats.json', 'w') as f:
-                json.dump(self.health_stats, f, indent=2)
-        except Exception as e:
-            _LOGGER.error(f"Failed to save health stats: {str(e)}")
-
     async def async_generate_status_data(self, *args):
         """Generate status data for Home Assistant sensors."""
         connected_count = sum(1 for d in self.active_devices.values() if d.get('status') == 'connected')
@@ -524,12 +502,26 @@ class ContinuouslyCastingDashboardsFuture:
         
         # Save status data to file for Home Assistant
         try:
-            with open('/config/continuously_casting_dashboards/status.json', 'w') as f:
-                json.dump(status_data, f, indent=2)
+            def write_status_file():
+                os.makedirs('/config/continuously_casting_dashboards', exist_ok=True)
+                with open('/config/continuously_casting_dashboards/status.json', 'w') as f:
+                    json.dump(status_data, f, indent=2)
+                    
+            await self.hass.async_add_executor_job(write_status_file)
         except Exception as e:
             _LOGGER.error(f"Failed to save status data: {str(e)}")
             
-        # Update the Home Assistant state if needed
-        # You could add state entities here if desired
-        
         return status_data
+    
+    async def async_save_health_stats(self):
+        """Save health statistics to file."""
+        try:
+            def write_health_stats():
+                stats_dir = '/config/continuously_casting_dashboards'
+                os.makedirs(stats_dir, exist_ok=True)
+                with open(f'{stats_dir}/health_stats.json', 'w') as f:
+                    json.dump(self.health_stats, f, indent=2)
+                    
+            await self.hass.async_add_executor_job(write_health_stats)
+        except Exception as e:
+            _LOGGER.error(f"Failed to save health stats: {str(e)}")
