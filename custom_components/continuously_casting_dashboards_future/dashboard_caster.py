@@ -333,11 +333,17 @@ async def async_get_device_ip(self, device_name):
         """Check if the switch entity exists in Home Assistant."""
         try:
             # Get state of the switch entity
-            state = self.hass.states.get(self.config_entry.options.get(CONF_SWITCH_ENTITY, ""))
+            switch_entity = self.config_entry.options.get(CONF_SWITCH_ENTITY, "")
+            
+            # If no switch entity is configured, just return True
+            if not switch_entity:
+                return True
+                
+            state = self.hass.states.get(switch_entity)
             
             # If state is None, the entity doesn't exist
             if state is None:
-                _LOGGER.warning(f"Switch entity {self.config_entry.options.get(CONF_SWITCH_ENTITY, '')} does not exist")
+                _LOGGER.warning(f"Switch entity {switch_entity} does not exist")
                 return False
                 
             return True
