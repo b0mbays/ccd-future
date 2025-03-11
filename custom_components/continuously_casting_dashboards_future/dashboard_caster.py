@@ -230,7 +230,7 @@ class ContinuouslyCastingDashboardsFuture:
             _LOGGER.error(f"Error checking device status at {ip}: {str(e)}")
             return False
 
-    async def async_get_device_ip(self, device_name):
+async def async_get_device_ip(self, device_name):
     """Get IP address for a device name using catt scan or a cached mapping."""
     # First check if we have a cached mapping
     device_map_file = '/config/continuously_casting_dashboards/device_map.json'
