@@ -1,0 +1,6 @@
+{
+  "name": "Continuously Casting Dashboard Future",
+  "domains": ["continuously_casting_dashboards_future"],
+  "documentation": "https://github.com/b0mbays/continuously-casting-dashboards/blob/main/README.md",
+  "version": "2.0.0"
+}
