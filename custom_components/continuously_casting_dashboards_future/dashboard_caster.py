@@ -231,59 +231,78 @@ class ContinuouslyCastingDashboardsFuture:
             return False
 
     async def async_get_device_ip(self, device_name):
-        """Get IP address for a device name using catt scan or a cached mapping."""
-        # First check if we have a cached mapping
-        device_map_file = '/config/continuously_casting_dashboards/device_map.json'
-        device_map = {}
-        
-        if os.path.exists(device_map_file):
-            try:
-                with open(device_map_file, 'r') as f:
-                    device_map = json.load(f)
-            except Exception:
-                pass
-        
-        # If we have a cached IP for this device, use it
-        if device_name in device_map and device_map[device_name]:
-            return device_map[device_name]
-        
-        # Otherwise, scan for devices
+    """Get IP address for a device name using catt scan or a cached mapping."""
+    # First check if we have a cached mapping
+    device_map_file = '/config/continuously_casting_dashboards/device_map.json'
+    device_map = {}
+    
+    if os.path.exists(device_map_file):
         try:
-            _LOGGER.info(f"Scanning for device: {device_name}")
-            process = await asyncio.create_subprocess_exec(
-                'catt', 'scan',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                _LOGGER.error(f"Catt scan failed: {stderr.decode().strip()}")
-                return None
-            
-            # Parse scan results
-            for line in stdout.decode().splitlines():
-                if device_name in line:
-                    # Extract IP address from line like: "Device name (IP: 192.168.0.123)"
-                    parts = line.split('(IP: ')
-                    if len(parts) > 1:
-                        ip = parts[1].split(')')[0].strip()
-                        
-                        # Cache the mapping
-                        device_map[device_name] = ip
-                        try:
-                            with open(device_map_file, 'w') as f:
-                                json.dump(device_map, f, indent=2)
-                        except Exception as e:
-                            _LOGGER.warning(f"Failed to save device map: {str(e)}")
-                        
-                        return ip
-            
-            _LOGGER.error(f"Device {device_name} not found in scan results")
-            return None
+            with open(device_map_file, 'r') as f:
+                device_map = json.load(f)
         except Exception as e:
-            _LOGGER.error(f"Error scanning for devices: {str(e)}")
+            _LOGGER.warning(f"Failed to load device map: {str(e)}")
+    
+    # If we have a cached IP for this device, use it
+    if device_name in device_map and device_map[device_name]:
+        _LOGGER.debug(f"Using cached IP {device_map[device_name]} for {device_name}")
+        return device_map[device_name]
+    
+    # Otherwise, scan for devices
+    try:
+        _LOGGER.info(f"Scanning for device: {device_name}")
+        process = await asyncio.create_subprocess_exec(
+            'catt', 'scan', '--timeout', '10',  # Longer timeout
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        scan_output = stdout.decode()
+        _LOGGER.info(f"Full scan output: {scan_output}")
+        
+        if process.returncode != 0:
+            _LOGGER.error(f"Catt scan failed: {stderr.decode().strip()}")
             return None
+        
+        # Parse scan results - now with correct format parsing
+        for line in scan_output.splitlines():
+            # Skip the header line or empty lines
+            if "Scanning Chromecasts..." in line or not line.strip():
+                continue
+                
+            _LOGGER.debug(f"Processing scan line: {line}")
+            
+            # Parse format: "192.168.0.16 - Basement display - Google Inc. Google Nest Hub"
+            parts = line.split(' - ')
+            if len(parts) < 2:
+                continue
+                
+            ip = parts[0].strip()
+            found_name = parts[1].strip() if len(parts) > 1 else ""
+            
+            _LOGGER.debug(f"Found device: {found_name} with IP: {ip}")
+            
+            # Case-insensitive exact match or substring match as fallback
+            if device_name.lower() == found_name.lower() or device_name.lower() in found_name.lower():
+                _LOGGER.info(f"Matched device '{device_name}' to scan result '{found_name}' with IP {ip}")
+                
+                # Cache the mapping
+                device_map[device_name] = ip
+                try:
+                    os.makedirs('/config/continuously_casting_dashboards', exist_ok=True)
+                    with open(device_map_file, 'w') as f:
+                        json.dump(device_map, f, indent=2)
+                except Exception as e:
+                    _LOGGER.warning(f"Failed to save device map: {str(e)}")
+                
+                return ip
+        
+        _LOGGER.error(f"Device {device_name} not found in scan results")
+        return None
+    except Exception as e:
+        _LOGGER.error(f"Error scanning for devices: {str(e)}")
+        return None
 
     async def async_is_within_time_window(self, device_name, device_config):
         """Check if current time is within the casting window for a device."""
