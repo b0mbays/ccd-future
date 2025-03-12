@@ -4,7 +4,7 @@ import logging
 import os
 import subprocess
 import time
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 import json
 import voluptuous as vol
 from homeassistant.const import CONF_DEVICES, CONF_SCAN_INTERVAL
@@ -24,7 +24,7 @@ class ContinuouslyCastingDashboardsFuture:
         self.config = config
         self.active_devices = {}
         self.health_stats = {}
-        self.device_scan_interval = config.get(CONF_SCAN_INTERVAL, 300)
+        self.device_scan_interval = config.get(CONF_SCAN_INTERVAL, 30)
         self.cast_delay = config.get('cast_delay', 0)
         self.start_time = config.get('start_time', '00:00')
         self.end_time = config.get('end_time', '23:59')
@@ -39,7 +39,7 @@ class ContinuouslyCastingDashboardsFuture:
         # Set up logging based on config
         log_level = config.get('logging_level', 'INFO').upper()
         logging.getLogger(__name__).setLevel(getattr(logging, log_level))
-
+    
     async def start(self):
         """Start the casting process."""
         _LOGGER.info("Starting Continuously Casting Dashboards integration")
@@ -52,7 +52,7 @@ class ContinuouslyCastingDashboardsFuture:
             async_track_time_interval(
                 self.hass, 
                 self.async_monitor_devices, 
-                dt_util.timedelta(seconds=self.device_scan_interval)
+                timedelta(seconds=self.device_scan_interval)
             )
         )
         
@@ -64,11 +64,12 @@ class ContinuouslyCastingDashboardsFuture:
             async_track_time_interval(
                 self.hass,
                 self.async_generate_status_data,
-                dt_util.timedelta(minutes=5)
+                timedelta(minutes=5)
             )
         )
         
         return True
+
 
     async def stop(self):
         """Stop the casting process."""
@@ -157,14 +158,21 @@ class ContinuouslyCastingDashboardsFuture:
                 # Use catt to cast the dashboard
                 _LOGGER.debug(f"Casting {dashboard_url} to {ip} (attempt {attempt+1}/{max_retries})")
                 
-                # Run catt command
+                # Run catt command - add full command logging
                 cmd = ['catt', '-d', ip, 'cast_site', dashboard_url]
+                _LOGGER.debug(f"Executing command: {' '.join(cmd)}")
+                
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
                 stdout, stderr = await process.communicate()
+                
+                # Log the full output
+                _LOGGER.debug(f"Command stdout: {stdout.decode().strip()}")
+                _LOGGER.debug(f"Command stderr: {stderr.decode().strip()}")
+                _LOGGER.debug(f"Command return code: {process.returncode}")
                 
                 if process.returncode != 0:
                     error_msg = stderr.decode().strip() or "Unknown error"
@@ -175,6 +183,8 @@ class ContinuouslyCastingDashboardsFuture:
                 if volume is not None:
                     _LOGGER.debug(f"Setting volume to {volume} for device at {ip}")
                     vol_cmd = ['catt', '-d', ip, 'volume', str(volume)]
+                    _LOGGER.debug(f"Executing command: {' '.join(vol_cmd)}")
+                    
                     vol_process = await asyncio.create_subprocess_exec(
                         *vol_cmd,
                         stdout=asyncio.subprocess.PIPE,
@@ -182,13 +192,23 @@ class ContinuouslyCastingDashboardsFuture:
                     )
                     vol_stdout, vol_stderr = await vol_process.communicate()
                     
+                    # Log volume command output
+                    _LOGGER.debug(f"Volume command stdout: {vol_stdout.decode().strip()}")
+                    _LOGGER.debug(f"Volume command stderr: {vol_stderr.decode().strip()}")
+                    _LOGGER.debug(f"Volume command return code: {vol_process.returncode}")
+                    
                     if vol_process.returncode != 0:
                         vol_error = vol_stderr.decode().strip()
                         _LOGGER.warning(f"Failed to set volume for {ip}: {vol_error}")
                 
                 # Verify the device is actually casting
+                _LOGGER.debug(f"Waiting 5 seconds to verify casting...")
                 await asyncio.sleep(5)  # Give it a moment to start casting
-                if await self.async_check_device_status(ip):
+                
+                status_check = await self.async_check_device_status(ip)
+                _LOGGER.debug(f"Status check result: {status_check}")
+                
+                if status_check:
                     _LOGGER.info(f"Successfully cast to device at {ip}")
                     return True
                 else:
@@ -211,48 +231,62 @@ class ContinuouslyCastingDashboardsFuture:
     async def async_check_device_status(self, ip):
         """Check if a device is still casting using catt."""
         try:
+            _LOGGER.debug(f"Checking status for device at {ip}")
+            cmd = ['catt', '-d', ip, 'status']
+            _LOGGER.debug(f"Executing command: {' '.join(cmd)}")
+            
             process = await asyncio.create_subprocess_exec(
-                'catt', '-d', ip, 'status',
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await process.communicate()
             
+            # Log full output
+            stdout_str = stdout.decode().strip()
+            stderr_str = stderr.decode().strip()
+            _LOGGER.debug(f"Status command stdout: {stdout_str}")
+            _LOGGER.debug(f"Status command stderr: {stderr_str}")
+            _LOGGER.debug(f"Status command return code: {process.returncode}")
+            
             # Parse output to check if it's actually casting
             if process.returncode == 0:
-                output = stdout.decode().strip()
+                output = stdout_str
+                _LOGGER.debug(f"Full status output: {output}")
+                
                 # If device is idle or not casting, return False
                 if "Idle" in output or "Nothing is currently playing" in output:
+                    _LOGGER.debug(f"Device at {ip} is idle or not casting")
                     return False
+                    
+                # Look for a Dummy, which indicates an actual dashboard is casting
+                if "Dummy" in output:
+                    dummy_line = next((line for line in output.splitlines() if "Dummy" in line), "")
+                    _LOGGER.debug(f"Device is playing: {dummy_line}")
+                    return True
+                else:
+                    # Device is on but no Dummy found, likely not casting a dashboard
+                    _LOGGER.debug(f"Device at {ip} is on but no Dummy text found in ouput - likely not casting a dashboard")
+                    return False
+                    
+                # Log more details about what's playing
+                if "URL:" in output:
+                    url_line = next((line for line in output.splitlines() if "URL:" in line), "")
+                    _LOGGER.debug(f"Device is playing URL: {url_line}")
+                    
+                # Check if the device is actually playing something
+                _LOGGER.debug(f"Device at {ip} appears to be casting")
                 return True
-            return False
+            else:
+                _LOGGER.warning(f"Status check failed with return code {process.returncode}: {stderr_str}")
+                return False
         except Exception as e:
             _LOGGER.error(f"Error checking device status at {ip}: {str(e)}")
             return False
 
+
     async def async_get_device_ip(self, device_name):
-        """Get IP address for a device name using catt scan or a cached mapping."""
-        # First check if we have a cached mapping
-        device_map_file = '/config/continuously_casting_dashboards/device_map.json'
-        device_map = {}
-        
-        if os.path.exists(device_map_file):
-            try:
-                # Use async_add_executor_job for file reading
-                def read_map_file():
-                    with open(device_map_file, 'r') as f:
-                        return json.load(f)
-                        
-                device_map = await self.hass.async_add_executor_job(read_map_file)
-            except Exception as e:
-                _LOGGER.warning(f"Failed to load device map: {str(e)}")
-        
-        # If we have a cached IP for this device, use it
-        if device_name in device_map and device_map[device_name]:
-            _LOGGER.debug(f"Using cached IP {device_map[device_name]} for {device_name}")
-            return device_map[device_name]
-        
-        # Otherwise, scan for devices
+        """Get IP address for a device name using catt scan without relying on cached mappings."""
         try:
             _LOGGER.info(f"Scanning for device: {device_name}")
             process = await asyncio.create_subprocess_exec(
@@ -263,13 +297,14 @@ class ContinuouslyCastingDashboardsFuture:
             stdout, stderr = await process.communicate()
             
             scan_output = stdout.decode()
-            _LOGGER.info(f"Full scan output: {scan_output}")
+            _LOGGER.debug(f"Full scan output: {scan_output}")
             
             if process.returncode != 0:
                 _LOGGER.error(f"Catt scan failed: {stderr.decode().strip()}")
                 return None
             
-            # Parse scan results
+            # Parse scan results and find exact matching device
+            found_devices = []
             for line in scan_output.splitlines():
                 # Skip the header line or empty lines
                 if "Scanning Chromecasts..." in line or not line.strip():
@@ -283,26 +318,18 @@ class ContinuouslyCastingDashboardsFuture:
                 ip = parts[0].strip()
                 found_name = parts[1].strip() if len(parts) > 1 else ""
                 
-                # Simple exact match - case sensitive for precision
-                if device_name == found_name:
+                # Collect all found devices for logging
+                found_devices.append((found_name, ip))
+                
+                # Exact match check (case-insensitive)
+                if found_name.lower() == device_name.lower():
                     _LOGGER.info(f"Matched device '{device_name}' with IP {ip}")
-                    
-                    # Cache the mapping
-                    device_map[device_name] = ip
-                    try:
-                        # Use async_add_executor_job for file writing
-                        def write_map_file():
-                            os.makedirs('/config/continuously_casting_dashboards', exist_ok=True)
-                            with open(device_map_file, 'w') as f:
-                                json.dump(device_map, f, indent=2)
-                                
-                        await self.hass.async_add_executor_job(write_map_file)
-                    except Exception as e:
-                        _LOGGER.warning(f"Failed to save device map: {str(e)}")
-                    
                     return ip
             
-            _LOGGER.error(f"Device '{device_name}' not found in scan results. Make sure the name matches exactly what appears in the scan output.")
+            # If we get here, no exact match was found
+            found_names = [name for name, _ in found_devices]
+            _LOGGER.error(f"Device '{device_name}' not found in scan results. Found devices: {found_names}")
+            _LOGGER.error(f"Make sure the name matches exactly what appears in the scan output.")
             return None
         except Exception as e:
             _LOGGER.error(f"Error scanning for devices: {str(e)}")
