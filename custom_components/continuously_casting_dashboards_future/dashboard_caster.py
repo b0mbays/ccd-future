@@ -97,6 +97,17 @@ class ContinuouslyCastingDashboardsFuture:
                     _LOGGER.info(f"Outside casting time window for {device_name}, skipping initial cast")
                     continue
                 
+                # Get device IP
+                ip = await self.async_get_device_ip(device_name)
+                if not ip:
+                    _LOGGER.error(f"Could not get IP for {device_name}, skipping")
+                    continue
+                
+                # Check if media is playing before casting
+                if await self.async_is_media_playing(ip):
+                    _LOGGER.info(f"Media is currently playing on {device_name}, skipping initial cast")
+                    continue
+                
                 # Create task for each device
                 self.hass.async_create_task(
                     self.async_start_device(device_name, device_config)
@@ -116,6 +127,11 @@ class ContinuouslyCastingDashboardsFuture:
         ip = await self.async_get_device_ip(device_name)
         if not ip:
             _LOGGER.error(f"Could not get IP for {device_name}, skipping")
+            return
+        
+        # Check if media is playing before casting
+        if await self.async_is_media_playing(ip):
+            _LOGGER.info(f"Media is currently playing on {device_name}, skipping cast")
             return
         
         device_key = f"{device_name}_{ip}"
@@ -147,6 +163,84 @@ class ContinuouslyCastingDashboardsFuture:
                 'reconnect_attempts': 0
             }
 
+    async def async_is_media_playing(self, ip):
+        """Check if media (like Spotify or YouTube) is playing or paused on the device."""
+        try:
+            _LOGGER.debug(f"Checking if media is playing on device at {ip}")
+            cmd = ['catt', '-d', ip, 'status']
+            _LOGGER.debug(f"Executing command: {' '.join(cmd)}")
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            # Log full output
+            stdout_str = stdout.decode().strip()
+            stderr_str = stderr.decode().strip()
+            _LOGGER.debug(f"Status command stdout: {stdout_str}")
+            _LOGGER.debug(f"Status command stderr: {stderr_str}")
+            
+            if process.returncode != 0:
+                _LOGGER.warning(f"Status check failed with return code {process.returncode}: {stderr_str}")
+                return False
+            
+            # Check if Spotify or YouTube are mentioned in the status or if the state is PLAYING or PAUSED
+            status_lower = stdout_str.lower()
+            media_apps = ["spotify", "youtube", "netflix", "plex", "disney+", "hulu", "amazon prime"]
+            
+            # Check if any media app is in the status
+            is_media_app = any(app in status_lower for app in media_apps)
+            
+            # Check for PLAYING or PAUSED state
+            is_playing_or_paused = "playing" in status_lower or "paused" in status_lower
+            
+            # Additional check for app names in status output
+            app_playing = False
+            for line in stdout_str.splitlines():
+                if "Title:" in line and not "Dummy" in line:
+                    app_playing = True
+                    break
+            
+            if is_media_app or is_playing_or_paused or app_playing:
+                _LOGGER.info(f"Media is currently playing or paused on device at {ip}")
+                
+                # Double-check after 5 seconds to make sure it's not a transient state
+                _LOGGER.debug(f"Media detected, waiting 5 seconds before re-checking...")
+                await asyncio.sleep(5)
+                
+                # Re-check the media status
+                recheck_process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                recheck_stdout, recheck_stderr = await recheck_process.communicate()
+                recheck_stdout_str = recheck_stdout.decode().strip()
+                
+                if recheck_process.returncode == 0:
+                    recheck_status_lower = recheck_stdout_str.lower()
+                    is_media_app_recheck = any(app in recheck_status_lower for app in media_apps)
+                    is_playing_or_paused_recheck = "playing" in recheck_status_lower or "paused" in recheck_status_lower
+                    
+                    app_playing_recheck = False
+                    for line in recheck_stdout_str.splitlines():
+                        if "Title:" in line and not "Dummy" in line:
+                            app_playing_recheck = True
+                            break
+                    
+                    if is_media_app_recheck or is_playing_or_paused_recheck or app_playing_recheck:
+                        _LOGGER.info(f"Media is still playing or paused on device at {ip} after re-check")
+                        return True
+            
+            _LOGGER.debug(f"No media playing on device at {ip}")
+            return False
+        except Exception as e:
+            _LOGGER.error(f"Error checking media status on device at {ip}: {str(e)}")
+            return False
+
     async def async_cast_dashboard(self, ip, dashboard_url, device_config):
         """Cast a dashboard to a device with retry logic."""
         volume = device_config.get('volume', 5)
@@ -155,6 +249,11 @@ class ContinuouslyCastingDashboardsFuture:
         
         for attempt in range(max_retries):
             try:
+                # Check if media is playing before casting
+                if await self.async_is_media_playing(ip):
+                    _LOGGER.info(f"Media is currently playing on device at {ip}, skipping cast attempt")
+                    return False
+                
                 # Use catt to cast the dashboard
                 _LOGGER.debug(f"Casting {dashboard_url} to {ip} (attempt {attempt+1}/{max_retries})")
                 
@@ -392,6 +491,15 @@ class ContinuouslyCastingDashboardsFuture:
                     _LOGGER.warning(f"Could not get IP for {device_name}, skipping check")
                     continue
                 
+                # Check if media is playing before attempting to reconnect
+                if await self.async_is_media_playing(ip):
+                    _LOGGER.info(f"Media is currently playing on {device_name}, skipping status check")
+                    device_key = f"{device_name}_{ip}"
+                    if device_key in self.active_devices:
+                        self.active_devices[device_key]['status'] = 'media_playing'
+                        self.active_devices[device_key]['last_checked'] = datetime.now().isoformat()
+                    continue
+                
                 # Check if device is still casting
                 is_casting = await self.async_check_device_status(ip)
                 
@@ -435,6 +543,13 @@ class ContinuouslyCastingDashboardsFuture:
         # Skip if outside time window
         if not await self.async_is_within_time_window(device_name, device_config):
             _LOGGER.info(f"Outside casting time window for {device_name}, skipping reconnect")
+            return False
+        
+        # Check if media is playing before attempting to reconnect
+        if await self.async_is_media_playing(ip):
+            _LOGGER.info(f"Media is currently playing on {device_name}, skipping reconnect")
+            if device_key in self.active_devices:
+                self.active_devices[device_key]['status'] = 'media_playing'
             return False
         
         # Increment reconnect attempts
@@ -505,13 +620,15 @@ class ContinuouslyCastingDashboardsFuture:
     async def async_generate_status_data(self, *args):
         """Generate status data for Home Assistant sensors."""
         connected_count = sum(1 for d in self.active_devices.values() if d.get('status') == 'connected')
-        disconnected_count = sum(1 for d in self.active_devices.values() if d.get('status') != 'connected')
+        disconnected_count = sum(1 for d in self.active_devices.values() if d.get('status') == 'disconnected')
+        media_playing_count = sum(1 for d in self.active_devices.values() if d.get('status') == 'media_playing')
         
         # Format for Home Assistant sensors
         status_data = {
             'total_devices': len(self.active_devices),
             'connected_devices': connected_count,
             'disconnected_devices': disconnected_count,
+            'media_playing_devices': media_playing_count,
             'last_updated': datetime.now().isoformat(),
             'devices': {}
         }
