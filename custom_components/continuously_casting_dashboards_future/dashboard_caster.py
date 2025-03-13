@@ -32,6 +32,7 @@ class ContinuouslyCastingDashboardsFuture:
         self.devices = config.get(CONF_DEVICES, {})
         self.running = True
         self.unsubscribe_listeners = []
+        self.device_ip_cache = {}  # Cache for device IPs
         
         # Ensure directory exists
         os.makedirs('/config/continuously_casting_dashboards', exist_ok=True)
@@ -70,7 +71,6 @@ class ContinuouslyCastingDashboardsFuture:
         
         return True
 
-
     async def stop(self):
         """Stop the casting process."""
         _LOGGER.info("Stopping Continuously Casting Dashboards integration")
@@ -89,28 +89,48 @@ class ContinuouslyCastingDashboardsFuture:
             _LOGGER.info("Switch entity disabled, skipping initial device setup")
             return True
         
+        # Perform a single scan to find all devices
+        device_ip_map = {}
+        for device_name in self.devices.keys():
+            ip = await self.async_get_device_ip(device_name)
+            if ip:
+                device_ip_map[device_name] = ip
+            else:
+                _LOGGER.error(f"Could not get IP for {device_name}, skipping initial setup for this device")
+                
+        # Add delay between scanning and casting to avoid overwhelming the network
+        await asyncio.sleep(2)
+        
         # Start each device with appropriate delay
         for device_name, device_configs in self.devices.items():
+            if device_name not in device_ip_map:
+                continue
+                
+            ip = device_ip_map[device_name]
+            
             for device_config in device_configs:
                 # Check if device is within casting time window
                 if not await self.async_is_within_time_window(device_name, device_config):
                     _LOGGER.info(f"Outside casting time window for {device_name}, skipping initial cast")
                     continue
                 
-                # Get device IP
-                ip = await self.async_get_device_ip(device_name)
-                if not ip:
-                    _LOGGER.error(f"Could not get IP for {device_name}, skipping")
-                    continue
-                
-                # Check if media is playing before casting
+                # Check if media is playing
                 if await self.async_is_media_playing(ip):
                     _LOGGER.info(f"Media is currently playing on {device_name}, skipping initial cast")
+                    device_key = f"{device_name}_{ip}"
+                    self.active_devices[device_key] = {
+                        'name': device_name,
+                        'ip': ip,
+                        'status': 'media_playing',
+                        'first_seen': datetime.now().isoformat(),
+                        'last_checked': datetime.now().isoformat(),
+                        'reconnect_attempts': 0
+                    }
                     continue
                 
                 # Create task for each device
                 self.hass.async_create_task(
-                    self.async_start_device(device_name, device_config)
+                    self.async_start_device(device_name, device_config, ip)
                 )
                 
                 # Apply cast delay between devices
@@ -119,19 +139,29 @@ class ContinuouslyCastingDashboardsFuture:
         
         return True
 
-    async def async_start_device(self, device_name, device_config):
+    async def async_start_device(self, device_name, device_config, ip=None):
         """Start casting to a specific device."""
         _LOGGER.info(f"Starting casting to {device_name}")
         
-        # Get device IP from name
-        ip = await self.async_get_device_ip(device_name)
+        # Get device IP if not provided
         if not ip:
-            _LOGGER.error(f"Could not get IP for {device_name}, skipping")
-            return
+            ip = await self.async_get_device_ip(device_name)
+            if not ip:
+                _LOGGER.error(f"Could not get IP for {device_name}, skipping")
+                return
         
         # Check if media is playing before casting
         if await self.async_is_media_playing(ip):
             _LOGGER.info(f"Media is currently playing on {device_name}, skipping cast")
+            device_key = f"{device_name}_{ip}"
+            self.active_devices[device_key] = {
+                'name': device_name,
+                'ip': ip,
+                'status': 'media_playing',
+                'first_seen': datetime.now().isoformat(),
+                'last_checked': datetime.now().isoformat(),
+                'reconnect_attempts': 0
+            }
             return
         
         device_key = f"{device_name}_{ip}"
@@ -186,55 +216,52 @@ class ContinuouslyCastingDashboardsFuture:
             if process.returncode != 0:
                 _LOGGER.warning(f"Status check failed with return code {process.returncode}: {stderr_str}")
                 return False
+                
+            # Check for "idle" state that only shows volume info
+            if len(stdout_str.splitlines()) <= 2 and all(line.startswith("Volume") for line in stdout_str.splitlines()):
+                _LOGGER.debug(f"Device at {ip} is idle (only volume info returned)")
+                return False
             
-            # Check if Spotify or YouTube are mentioned in the status or if the state is PLAYING or PAUSED
-            status_lower = stdout_str.lower()
-            media_apps = ["spotify", "youtube", "netflix", "plex", "disney+", "hulu", "amazon prime"]
-            
-            # Check if any media app is in the status
-            is_media_app = any(app in status_lower for app in media_apps)
-            
-            # Check for PLAYING or PAUSED state
-            is_playing_or_paused = "playing" in status_lower or "paused" in status_lower
-            
-            # Additional check for app names in status output
-            app_playing = False
+            # Check for a status line that contains "Casting: Starting" which indicates media is about to play
+            if "Casting: Starting" in stdout_str:
+                _LOGGER.info(f"Device at {ip} is starting to cast media")
+                return True
+                
+            # Check for references to Google Assistant, which means a voice command is being handled
+            if "assistant" in stdout_str.lower():
+                _LOGGER.info(f"Device at {ip} is processing a Google Assistant command")
+                return True
+                
+            # If we get "Idle" or "Nothing is currently playing", no media is playing
+            if "Idle" in stdout_str or "Nothing is currently playing" in stdout_str:
+                _LOGGER.debug(f"Device at {ip} is idle or not playing anything")
+                return False
+                
+            # Check if we have a "State: PLAYING" or "State: PAUSED" or "State: BUFFERING" line
             for line in stdout_str.splitlines():
-                if "Title:" in line and not "Dummy" in line:
-                    app_playing = True
-                    break
-            
-            if is_media_app or is_playing_or_paused or app_playing:
-                _LOGGER.info(f"Media is currently playing or paused on device at {ip}")
-                
-                # Double-check after 5 seconds to make sure it's not a transient state
-                _LOGGER.debug(f"Media detected, waiting 5 seconds before re-checking...")
-                await asyncio.sleep(5)
-                
-                # Re-check the media status
-                recheck_process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                recheck_stdout, recheck_stderr = await recheck_process.communicate()
-                recheck_stdout_str = recheck_stdout.decode().strip()
-                
-                if recheck_process.returncode == 0:
-                    recheck_status_lower = recheck_stdout_str.lower()
-                    is_media_app_recheck = any(app in recheck_status_lower for app in media_apps)
-                    is_playing_or_paused_recheck = "playing" in recheck_status_lower or "paused" in recheck_status_lower
+                if "State:" in line and ("PLAYING" in line or "PAUSED" in line or "BUFFERING" in line):
+                    _LOGGER.info(f"Found {line} - media is active on device at {ip}")
+                    return True
                     
-                    app_playing_recheck = False
-                    for line in recheck_stdout_str.splitlines():
-                        if "Title:" in line and not "Dummy" in line:
-                            app_playing_recheck = True
-                            break
+            # Check for a "Title:" line that is not "Dummy" (dashboard)
+            for line in stdout_str.splitlines():
+                if "Title:" in line and "Dummy" not in line:
+                    _LOGGER.info(f"Found '{line}' - media content is active on device at {ip}")
+                    return True
                     
-                    if is_media_app_recheck or is_playing_or_paused_recheck or app_playing_recheck:
-                        _LOGGER.info(f"Media is still playing or paused on device at {ip} after re-check")
-                        return True
-            
+            # Check if any known media app name is in the output
+            status_lower = stdout_str.lower()
+            media_apps = ["spotify", "youtube", "netflix", "plex", "disney+", "hulu", "amazon prime", "music", "audio", "video", "cast"]
+            for app in media_apps:
+                if app in status_lower:
+                    _LOGGER.info(f"Found '{app}' in status - media app is active on device at {ip}")
+                    return True
+                    
+            # At this point, check if anything is playing at all (that's not our dashboard)
+            if "Dummy" not in stdout_str and ("playing" in status_lower or "paused" in status_lower or "buffering" in status_lower):
+                _LOGGER.info(f"Found playing/paused/buffering state but not our dashboard - media is active on device at {ip}")
+                return True
+                
             _LOGGER.debug(f"No media playing on device at {ip}")
             return False
         except Exception as e:
@@ -246,6 +273,7 @@ class ContinuouslyCastingDashboardsFuture:
         volume = device_config.get('volume', 5)
         max_retries = 5
         retry_delay = 10  # seconds
+        verification_wait_time = 15  # Increased from 5 to 15 seconds to give devices more time to load
         
         for attempt in range(max_retries):
             try:
@@ -269,14 +297,20 @@ class ContinuouslyCastingDashboardsFuture:
                 stdout, stderr = await process.communicate()
                 
                 # Log the full output
-                _LOGGER.debug(f"Command stdout: {stdout.decode().strip()}")
-                _LOGGER.debug(f"Command stderr: {stderr.decode().strip()}")
+                stdout_str = stdout.decode().strip()
+                stderr_str = stderr.decode().strip()
+                _LOGGER.debug(f"Command stdout: {stdout_str}")
+                _LOGGER.debug(f"Command stderr: {stderr_str}")
                 _LOGGER.debug(f"Command return code: {process.returncode}")
                 
+                # Check if the cast command itself failed
                 if process.returncode != 0:
-                    error_msg = stderr.decode().strip() or "Unknown error"
+                    error_msg = stderr_str or "Unknown error"
                     _LOGGER.error(f"Catt command failed: {error_msg}")
                     raise Exception(f"Catt command failed: {error_msg}")
+                
+                # If stdout contains success message like "Casting ... on device", consider it likely successful
+                cast_likely_succeeded = "Casting" in stdout_str and "on" in stdout_str
                 
                 # Set volume after successful cast
                 if volume is not None:
@@ -301,14 +335,18 @@ class ContinuouslyCastingDashboardsFuture:
                         _LOGGER.warning(f"Failed to set volume for {ip}: {vol_error}")
                 
                 # Verify the device is actually casting
-                _LOGGER.debug(f"Waiting 5 seconds to verify casting...")
-                await asyncio.sleep(5)  # Give it a moment to start casting
+                _LOGGER.debug(f"Waiting {verification_wait_time} seconds to verify casting...")
+                await asyncio.sleep(verification_wait_time)  # Give it more time to start casting
                 
                 status_check = await self.async_check_device_status(ip)
                 _LOGGER.debug(f"Status check result: {status_check}")
                 
+                # If status check passes or the cast command looked successful, consider it a success
                 if status_check:
                     _LOGGER.info(f"Successfully cast to device at {ip}")
+                    return True
+                elif cast_likely_succeeded:
+                    _LOGGER.info(f"Cast command succeeded but status check didn't detect dashboard yet. Assuming success.")
                     return True
                 else:
                     _LOGGER.warning(f"Cast command appeared to succeed but device status check failed")
@@ -328,7 +366,7 @@ class ContinuouslyCastingDashboardsFuture:
         return False
 
     async def async_check_device_status(self, ip):
-        """Check if a device is still casting using catt."""
+        """Check if a device is still casting our dashboard specifically."""
         try:
             _LOGGER.debug(f"Checking status for device at {ip}")
             cmd = ['catt', '-d', ip, 'status']
@@ -348,34 +386,35 @@ class ContinuouslyCastingDashboardsFuture:
             _LOGGER.debug(f"Status command stderr: {stderr_str}")
             _LOGGER.debug(f"Status command return code: {process.returncode}")
             
-            # Parse output to check if it's actually casting
+            # Parse output to check if it's actually casting our dashboard
             if process.returncode == 0:
                 output = stdout_str
-                _LOGGER.debug(f"Full status output: {output}")
                 
-                # If device is idle or not casting, return False
+                # Check for "idle" state that only shows volume info
+                if len(stdout_str.splitlines()) <= 2 and all(line.startswith("Volume") for line in stdout_str.splitlines()):
+                    _LOGGER.debug(f"Device at {ip} is idle (only volume info returned)")
+                    return False
+                    
+                # If device explicitly says idle or nothing playing, return False
                 if "Idle" in output or "Nothing is currently playing" in output:
                     _LOGGER.debug(f"Device at {ip} is idle or not casting")
                     return False
                     
-                # Look for a Dummy, which indicates an actual dashboard is casting
+                # Look for "Dummy" or our dashboard URL, which indicates our dashboard is casting
                 if "Dummy" in output:
                     dummy_line = next((line for line in output.splitlines() if "Dummy" in line), "")
-                    _LOGGER.debug(f"Device is playing: {dummy_line}")
+                    _LOGGER.debug(f"Dashboard found: {dummy_line}")
                     return True
-                else:
-                    # Device is on but no Dummy found, likely not casting a dashboard
-                    _LOGGER.debug(f"Device at {ip} is on but no Dummy text found in ouput - likely not casting a dashboard")
-                    return False
-                    
-                # Log more details about what's playing
-                if "URL:" in output:
-                    url_line = next((line for line in output.splitlines() if "URL:" in line), "")
-                    _LOGGER.debug(f"Device is playing URL: {url_line}")
-                    
-                # Check if the device is actually playing something
-                _LOGGER.debug(f"Device at {ip} appears to be casting")
-                return True
+                
+                # Check for dashboard-specific indicators in the output
+                dashboard_indicators = ["8123", "dashboard", "kiosk", "homeassistant"]
+                if any(indicator in output.lower() for indicator in dashboard_indicators):
+                    _LOGGER.debug(f"Dashboard indicators found in status")
+                    return True
+                
+                # If we get here, device is playing something but not our dashboard
+                _LOGGER.debug(f"Device at {ip} is playing something, but not our dashboard")
+                return False
             else:
                 _LOGGER.warning(f"Status check failed with return code {process.returncode}: {stderr_str}")
                 return False
@@ -383,11 +422,21 @@ class ContinuouslyCastingDashboardsFuture:
             _LOGGER.error(f"Error checking device status at {ip}: {str(e)}")
             return False
 
-
     async def async_get_device_ip(self, device_name):
         """Get IP address for a device name using catt scan without relying on cached mappings."""
         try:
             _LOGGER.info(f"Scanning for device: {device_name}")
+            # Check if we've already cached the device to speed up lookups
+            if hasattr(self, 'device_ip_cache'):
+                # Cache exists and device is in cache
+                if device_name in self.device_ip_cache and self.device_ip_cache[device_name]['timestamp'] > (time.time() - 300):
+                    _LOGGER.debug(f"Using cached IP for {device_name}: {self.device_ip_cache[device_name]['ip']}")
+                    return self.device_ip_cache[device_name]['ip']
+            else:
+                # Initialize cache
+                self.device_ip_cache = {}
+                
+            # Do a fresh scan
             process = await asyncio.create_subprocess_exec(
                 'catt', 'scan',
                 stdout=asyncio.subprocess.PIPE,
@@ -419,6 +468,12 @@ class ContinuouslyCastingDashboardsFuture:
                 
                 # Collect all found devices for logging
                 found_devices.append((found_name, ip))
+                
+                # Update the cache for all found devices to speed up future lookups
+                self.device_ip_cache[found_name] = {
+                    'ip': ip,
+                    'timestamp': time.time()
+                }
                 
                 # Exact match check (case-insensitive)
                 if found_name.lower() == device_name.lower():
@@ -478,63 +533,143 @@ class ContinuouslyCastingDashboardsFuture:
         if not await self.async_check_switch_entity():
             _LOGGER.info("Switch entity disabled, skipping device monitoring")
             return
+            
+        # Scan for all devices at once and store IPs
+        device_ip_map = {}
+        for device_name in self.devices.keys():
+            ip = await self.async_get_device_ip(device_name)
+            if ip:
+                device_ip_map[device_name] = ip
+            else:
+                _LOGGER.warning(f"Could not get IP for {device_name}, skipping check")
         
+        # Process each device with its known IP
         for device_name, device_configs in self.devices.items():
+            # Skip if we couldn't get the IP
+            if device_name not in device_ip_map:
+                continue
+                
+            ip = device_ip_map[device_name]
+            device_key = f"{device_name}_{ip}"
+                
             for device_config in device_configs:
                 # Skip devices outside their time window
                 if not await self.async_is_within_time_window(device_name, device_config):
                     _LOGGER.debug(f"Outside casting time window for {device_name}, skipping check")
                     continue
                 
-                ip = await self.async_get_device_ip(device_name)
-                if not ip:
-                    _LOGGER.warning(f"Could not get IP for {device_name}, skipping check")
-                    continue
-                
                 # Check if media is playing before attempting to reconnect
-                if await self.async_is_media_playing(ip):
+                is_media_playing = await self.async_is_media_playing(ip)
+                if is_media_playing:
                     _LOGGER.info(f"Media is currently playing on {device_name}, skipping status check")
-                    device_key = f"{device_name}_{ip}"
+                    # Update device status to media_playing
                     if device_key in self.active_devices:
-                        self.active_devices[device_key]['status'] = 'media_playing'
+                        # If device was previously connected to our dashboard, add a delay before marking as media_playing
+                        # This prevents rapid switching when "Hey Google" commands are being processed
+                        if self.active_devices[device_key].get('status') == 'connected':
+                            _LOGGER.info(f"Device {device_name} was showing our dashboard but now has media - giving it time to stabilize")
+                            # Don't update the status yet, let it remain as 'connected' for this cycle
+                        else:
+                            self.active_devices[device_key]['status'] = 'media_playing'
                         self.active_devices[device_key]['last_checked'] = datetime.now().isoformat()
+                    else:
+                        # First time seeing this device
+                        self.active_devices[device_key] = {
+                            'name': device_name,
+                            'ip': ip,
+                            'status': 'media_playing',
+                            'first_seen': datetime.now().isoformat(),
+                            'last_checked': datetime.now().isoformat(),
+                            'reconnect_attempts': 0
+                        }
                     continue
                 
-                # Check if device is still casting
+                # Check if device is still casting our dashboard
                 is_casting = await self.async_check_device_status(ip)
                 
+                # Check if device is idle with just volume info
+                cmd = ['catt', '-d', ip, 'status']
+                status_process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                status_stdout, status_stderr = await status_process.communicate()
+                status_output = status_stdout.decode().strip()
+                
+                # If only volume info is returned, device is truly idle
+                is_idle = len(status_output.splitlines()) <= 2 and all(line.startswith("Volume") for line in status_output.splitlines())
+                
                 # Update device status
-                device_key = f"{device_name}_{ip}"
                 if device_key in self.active_devices:
                     previous_status = self.active_devices[device_key].get('status', 'unknown')
-                    self.active_devices[device_key]['status'] = 'connected' if is_casting else 'disconnected'
+                    last_status_change = self.active_devices[device_key].get('last_status_change', 0)
+                    current_time = time.time()
+                    
+                    # Determine current state and take appropriate action
+                    if is_casting:
+                        # Device is showing our dashboard
+                        if previous_status != 'connected':
+                            self.active_devices[device_key]['last_status_change'] = current_time
+                        self.active_devices[device_key]['status'] = 'connected'
+                        if previous_status != 'connected':
+                            _LOGGER.info(f"Device {device_name} ({ip}) is now connected")
+                            self.active_devices[device_key]['reconnect_attempts'] = 0
+                            await self.async_update_health_stats(device_key, 'reconnected')
+                    elif is_idle:
+                        # Device is idle, should show our dashboard
+                        # Add a delay after any status change to prevent rapid reconnects
+                        # This gives voice commands time to be processed
+                        min_time_between_reconnects = 30  # seconds
+                        time_since_last_change = current_time - last_status_change
+                        
+                        if previous_status != 'disconnected':
+                            _LOGGER.info(f"Device {device_name} ({ip}) is idle and not casting our dashboard")
+                            self.active_devices[device_key]['status'] = 'disconnected'
+                            self.active_devices[device_key]['last_status_change'] = current_time
+                        else:
+                            # Only attempt to reconnect if enough time has passed since last status change
+                            if time_since_last_change > min_time_between_reconnects:
+                                _LOGGER.info(f"Device {device_name} ({ip}) is still idle after waiting period, attempting reconnect")
+                                await self.async_reconnect_device(device_name, ip, device_config)
+                            else:
+                                _LOGGER.debug(f"Device {device_name} ({ip}) is idle but waiting {int(min_time_between_reconnects - time_since_last_change)}s before reconnecting")
+                    else:
+                        # Device has other content
+                        if previous_status != 'other_content':
+                            self.active_devices[device_key]['last_status_change'] = current_time
+                        _LOGGER.info(f"Device {device_name} ({ip}) has other content (not our dashboard and not idle)")
+                        self.active_devices[device_key]['status'] = 'other_content'
+                    
+                    # Update timestamp regardless
                     self.active_devices[device_key]['last_checked'] = datetime.now().isoformat()
-                    
-                    # Device was connected but now disconnected
-                    if previous_status == 'connected' and not is_casting:
-                        _LOGGER.warning(f"Device {device_name} ({ip}) has disconnected, attempting to reconnect")
-                        await self.async_reconnect_device(device_name, ip, device_config)
-                    
-                    # Device was disconnected but now connected
-                    elif previous_status == 'disconnected' and is_casting:
-                        _LOGGER.info(f"Device {device_name} ({ip}) has reconnected")
-                        self.active_devices[device_key]['reconnect_attempts'] = 0
-                        await self.async_update_health_stats(device_key, 'reconnected')
                 else:
                     # First time seeing this device
+                    if is_casting:
+                        status = 'connected'
+                        _LOGGER.info(f"Device {device_name} ({ip}) is casting our dashboard")
+                    elif is_idle:
+                        status = 'disconnected'
+                        _LOGGER.info(f"Device {device_name} ({ip}) is idle, will attempt to connect after stabilization period")
+                    else:
+                        status = 'other_content'
+                        _LOGGER.info(f"Device {device_name} ({ip}) has other content, will not connect")
+                    
                     self.active_devices[device_key] = {
                         'name': device_name,
                         'ip': ip,
-                        'status': 'connected' if is_casting else 'disconnected',
+                        'status': status,
                         'first_seen': datetime.now().isoformat(),
                         'last_checked': datetime.now().isoformat(),
+                        'last_status_change': time.time(),
                         'reconnect_attempts': 0
                     }
                     
-                    # If not casting on first check, try to connect
-                    if not is_casting:
-                        _LOGGER.info(f"Device {device_name} ({ip}) not casting on first check, attempting to connect")
-                        await self.async_reconnect_device(device_name, ip, device_config)
+                    # Add a delay before first reconnect attempt to allow device to stabilize
+                    # This prevents reconnecting during voice command processing
+                    if status == 'disconnected':
+                        _LOGGER.info(f"Will attempt first connection to {device_name} in next monitoring cycle")
+                        # No immediate reconnect on first sight
 
     async def async_reconnect_device(self, device_name, ip, device_config):
         """Attempt to reconnect a disconnected device."""
@@ -558,13 +693,33 @@ class ContinuouslyCastingDashboardsFuture:
             attempts = self.active_devices[device_key]['reconnect_attempts']
             
             # If too many reconnect attempts, back off
-            if attempts > 5:
+            if attempts > 10:  # Increased from 5 to 10
                 _LOGGER.warning(f"Device {device_name} ({ip}) has had {attempts} reconnect attempts, backing off")
                 await self.async_update_health_stats(device_key, 'reconnect_failed')
                 return False
         
+        # Check status one more time to see if it's truly idle
+        cmd = ['catt', '-d', ip, 'status']
+        status_process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        status_stdout, status_stderr = await status_process.communicate()
+        status_output = status_stdout.decode().strip()
+        
+        # If device isn't idle (has more than just volume info), don't attempt to cast
+        if len(status_output.splitlines()) > 2 or not all(line.startswith("Volume") for line in status_output.splitlines()):
+            if "Dummy" not in status_output and "8123" not in status_output:
+                _LOGGER.info(f"Device {device_name} ({ip}) shows non-idle status, skipping reconnect")
+                if device_key in self.active_devices:
+                    self.active_devices[device_key]['status'] = 'other_content'
+                return False
+        
         _LOGGER.info(f"Attempting to reconnect to {device_name} ({ip})")
+        await self.async_update_health_stats(device_key, 'reconnect_attempt')
         dashboard_url = device_config.get('dashboard_url')
+        _LOGGER.debug(f"Casting URL {dashboard_url} to device {device_name} ({ip})")
         success = await self.async_cast_dashboard(ip, dashboard_url, device_config)
         
         if success:
@@ -622,6 +777,7 @@ class ContinuouslyCastingDashboardsFuture:
         connected_count = sum(1 for d in self.active_devices.values() if d.get('status') == 'connected')
         disconnected_count = sum(1 for d in self.active_devices.values() if d.get('status') == 'disconnected')
         media_playing_count = sum(1 for d in self.active_devices.values() if d.get('status') == 'media_playing')
+        other_content_count = sum(1 for d in self.active_devices.values() if d.get('status') == 'other_content')
         
         # Format for Home Assistant sensors
         status_data = {
@@ -629,6 +785,7 @@ class ContinuouslyCastingDashboardsFuture:
             'connected_devices': connected_count,
             'disconnected_devices': disconnected_count,
             'media_playing_devices': media_playing_count,
+            'other_content_devices': other_content_count,
             'last_updated': datetime.now().isoformat(),
             'devices': {}
         }
