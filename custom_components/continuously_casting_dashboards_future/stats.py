@@ -69,7 +69,15 @@ class StatsManager:
             self.health_stats[device_key]['failed_reconnects'] += 1
         
         # Save health stats to file
-        await self.async_save_health_stats()
+        try:
+            def write_health_stats():
+                os.makedirs('/config/continuously_casting_dashboards', exist_ok=True)
+                with open(HEALTH_STATS_FILE, 'w') as f:
+                    json.dump(self.health_stats, f, indent=2)
+                    
+            await self.hass.async_add_executor_job(write_health_stats)
+        except Exception as e:
+            _LOGGER.error(f"Failed to save health stats: {str(e)}")
 
     async def async_generate_status_data(self, *args):
         """Generate status data for Home Assistant sensors."""
@@ -98,3 +106,23 @@ class StatsManager:
         for device_key, device in active_devices.items():
             device_name = device.get('name', 'Unknown')
             ip = device.get('ip', 'Unknown')
+            
+            status_data['devices'][device_name] = {
+                'ip': ip,
+                'status': device.get('status', 'unknown'),
+                'last_checked': device.get('last_checked', ''),
+                'reconnect_attempts': device.get('reconnect_attempts', 0)
+            }
+        
+        # Save status data to file for Home Assistant
+        try:
+            def write_status_file():
+                os.makedirs('/config/continuously_casting_dashboards', exist_ok=True)
+                with open(STATUS_FILE, 'w') as f:
+                    json.dump(status_data, f, indent=2)
+                    
+            await self.hass.async_add_executor_job(write_status_file)
+        except Exception as e:
+            _LOGGER.error(f"Failed to save status data: {str(e)}")
+            
+        return status_data
