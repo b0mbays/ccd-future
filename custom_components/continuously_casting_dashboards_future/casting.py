@@ -19,7 +19,13 @@ class CastingManager:
 
     async def async_cast_dashboard(self, ip, dashboard_url, device_config):
         """Cast a dashboard to a device with retry logic."""
-        volume = device_config.get('volume', 5)
+        # Enhanced debug logging for troubleshooting
+        _LOGGER.debug(f"Device config received for {ip}: {device_config}")
+        
+        # Get config volume (use None if not specified)
+        config_volume = device_config.get('volume', None)
+        _LOGGER.debug(f"Config volume for {ip}: {config_volume}")
+        
         max_retries = self.config.get('max_retries', DEFAULT_MAX_RETRIES)
         retry_delay = self.config.get('retry_delay', DEFAULT_RETRY_DELAY)
         verification_wait_time = self.config.get('verification_wait_time', DEFAULT_VERIFICATION_WAIT_TIME)
@@ -31,13 +37,36 @@ class CastingManager:
                     _LOGGER.info(f"Media is currently playing on device at {ip}, skipping cast attempt")
                     return False
                 
+                # Before casting, check the current volume
+                current_volume = await self.async_get_current_volume(ip)
+                _LOGGER.debug(f"Current volume before casting for {ip}: {current_volume}")
+                
                 # Use catt to cast the dashboard
                 _LOGGER.debug(f"Casting {dashboard_url} to {ip} (attempt {attempt+1}/{max_retries})")
                 
-                # Run catt command - add full command logging
-                cmd = ['catt', '-d', ip, 'cast_site', dashboard_url]
-                _LOGGER.debug(f"Executing command: {' '.join(cmd)}")
+                # First stop any current casting
+                stop_cmd = ['catt', '-d', ip, 'stop']
+                _LOGGER.debug(f"Executing stop command: {' '.join(stop_cmd)}")
+                stop_process = await asyncio.create_subprocess_exec(
+                    *stop_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await stop_process.communicate()
                 
+                # Set volume to 0 initially
+                vol_cmd = ['catt', '-d', ip, 'volume', '0']
+                _LOGGER.debug(f"Setting initial volume to 0: {' '.join(vol_cmd)}")
+                vol_process = await asyncio.create_subprocess_exec(
+                    *vol_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await vol_process.communicate()
+                
+                # Cast the dashboard
+                cmd = ['catt', '-d', ip, 'cast_site', dashboard_url]
+                _LOGGER.debug(f"Executing cast command: {' '.join(cmd)}")
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -48,9 +77,9 @@ class CastingManager:
                 # Log the full output
                 stdout_str = stdout.decode().strip()
                 stderr_str = stderr.decode().strip()
-                _LOGGER.debug(f"Command stdout: {stdout_str}")
-                _LOGGER.debug(f"Command stderr: {stderr_str}")
-                _LOGGER.debug(f"Command return code: {process.returncode}")
+                _LOGGER.debug(f"Cast command stdout: {stdout_str}")
+                _LOGGER.debug(f"Cast command stderr: {stderr_str}")
+                _LOGGER.debug(f"Cast command return code: {process.returncode}")
                 
                 # Check if the cast command itself failed
                 if process.returncode != 0:
@@ -61,27 +90,32 @@ class CastingManager:
                 # If stdout contains success message like "Casting ... on device", consider it likely successful
                 cast_likely_succeeded = "Casting" in stdout_str and "on" in stdout_str
                 
-                # Set volume after successful cast
-                if volume is not None:
-                    _LOGGER.debug(f"Setting volume to {volume} for device at {ip}")
-                    vol_cmd = ['catt', '-d', ip, 'volume', str(volume)]
-                    _LOGGER.debug(f"Executing command: {' '.join(vol_cmd)}")
-                    
-                    vol_process = await asyncio.create_subprocess_exec(
-                        *vol_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    vol_stdout, vol_stderr = await vol_process.communicate()
-                    
-                    # Log volume command output
-                    _LOGGER.debug(f"Volume command stdout: {vol_stdout.decode().strip()}")
-                    _LOGGER.debug(f"Volume command stderr: {vol_stderr.decode().strip()}")
-                    _LOGGER.debug(f"Volume command return code: {vol_process.returncode}")
-                    
-                    if vol_process.returncode != 0:
-                        vol_error = vol_stderr.decode().strip()
-                        _LOGGER.warning(f"Failed to set volume for {ip}: {vol_error}")
+                # Determine the volume to set after casting:
+                # 1. If config_volume is specified and not None, use it
+                # 2. If no config_volume or it's None/unspecified, use the current_volume we detected
+                final_volume = config_volume if config_volume is not None else current_volume
+                
+                # Ensure we have a reasonable volume value
+                if final_volume is None or not isinstance(final_volume, (int, float)):
+                    final_volume = 5  # Default fallback
+                
+                _LOGGER.debug(f"Setting final volume to {final_volume} for device at {ip}")
+                final_vol_cmd = ['catt', '-d', ip, 'volume', str(final_volume)]
+                _LOGGER.debug(f"Executing final volume command: {' '.join(final_vol_cmd)}")
+                
+                final_vol_process = await asyncio.create_subprocess_exec(
+                    *final_vol_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                vol_stdout, vol_stderr = await final_vol_process.communicate()
+                
+                # Log volume command output
+                vol_stdout_str = vol_stdout.decode().strip()
+                vol_stderr_str = vol_stderr.decode().strip()
+                _LOGGER.debug(f"Volume command stdout: {vol_stdout_str}")
+                _LOGGER.debug(f"Volume command stderr: {vol_stderr_str}")
+                _LOGGER.debug(f"Volume command return code: {final_vol_process.returncode}")
                 
                 # Verify the device is actually casting
                 _LOGGER.debug(f"Waiting {verification_wait_time} seconds to verify casting...")
@@ -113,3 +147,43 @@ class CastingManager:
                     return False
         
         return False
+        
+    async def async_get_current_volume(self, ip):
+        """Get the current volume of a device."""
+        try:
+            cmd = ['catt', '-d', ip, 'status']
+            _LOGGER.debug(f"Getting current volume for {ip}: {' '.join(cmd)}")
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                _LOGGER.warning(f"Failed to get current volume for {ip}: {stderr.decode().strip()}")
+                return 5  # Default fallback
+                
+            status_output = stdout.decode().strip()
+            _LOGGER.debug(f"Current status output: {status_output}")
+            
+            # Try to extract volume information
+            for line in status_output.splitlines():
+                if line.startswith("Volume:"):
+                    try:
+                        volume_str = line.split(":", 1)[1].strip()
+                        volume = int(volume_str)
+                        _LOGGER.debug(f"Extracted current volume: {volume}")
+                        return volume
+                    except (ValueError, IndexError) as e:
+                        _LOGGER.warning(f"Failed to parse volume from status: {e}")
+                        return 5  # Default fallback
+            
+            # If we didn't find volume info
+            _LOGGER.warning(f"No volume information found in status output")
+            return 5  # Default fallback
+            
+        except Exception as e:
+            _LOGGER.error(f"Error getting current volume for {ip}: {str(e)}")
+            return 5  # Default fallback
