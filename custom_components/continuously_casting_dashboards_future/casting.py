@@ -90,33 +90,6 @@ class CastingManager:
                 # If stdout contains success message like "Casting ... on device", consider it likely successful
                 cast_likely_succeeded = "Casting" in stdout_str and "on" in stdout_str
                 
-                # Determine the volume to set after casting:
-                # 1. If config_volume is specified and not None, use it
-                # 2. If no config_volume or it's None/unspecified, use the current_volume we detected
-                final_volume = config_volume if config_volume is not None else current_volume
-                
-                # Ensure we have a reasonable volume value
-                if final_volume is None or not isinstance(final_volume, (int, float)):
-                    final_volume = 5  # Default fallback
-                
-                _LOGGER.debug(f"Setting final volume to {final_volume} for device at {ip}")
-                final_vol_cmd = ['catt', '-d', ip, 'volume', str(final_volume)]
-                _LOGGER.debug(f"Executing final volume command: {' '.join(final_vol_cmd)}")
-                
-                final_vol_process = await asyncio.create_subprocess_exec(
-                    *final_vol_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                vol_stdout, vol_stderr = await final_vol_process.communicate()
-                
-                # Log volume command output
-                vol_stdout_str = vol_stdout.decode().strip()
-                vol_stderr_str = vol_stderr.decode().strip()
-                _LOGGER.debug(f"Volume command stdout: {vol_stdout_str}")
-                _LOGGER.debug(f"Volume command stderr: {vol_stderr_str}")
-                _LOGGER.debug(f"Volume command return code: {final_vol_process.returncode}")
-                
                 # Verify the device is actually casting
                 _LOGGER.debug(f"Waiting {verification_wait_time} seconds to verify casting...")
                 await asyncio.sleep(verification_wait_time)  # Give it more time to start casting
@@ -124,7 +97,36 @@ class CastingManager:
                 status_check = await self.device_manager.async_check_device_status(ip)
                 _LOGGER.debug(f"Status check result: {status_check}")
                 
-                # If status check passes or the cast command looked successful, consider it a success
+                # Only set the volume after the status check confirms casting is successful
+                if status_check or cast_likely_succeeded:
+                    # Determine the volume to set after casting:
+                    # 1. If config_volume is specified and not None, use it
+                    # 2. If no config_volume or it's None/unspecified, use the current_volume we detected
+                    final_volume = config_volume if config_volume is not None else current_volume
+                    
+                    # Ensure we have a reasonable volume value
+                    if final_volume is None or not isinstance(final_volume, (int, float)):
+                        final_volume = 5  # Default fallback
+                    
+                    _LOGGER.debug(f"Setting final volume to {final_volume} for device at {ip}")
+                    final_vol_cmd = ['catt', '-d', ip, 'volume', str(final_volume)]
+                    _LOGGER.debug(f"Executing final volume command: {' '.join(final_vol_cmd)}")
+                    
+                    final_vol_process = await asyncio.create_subprocess_exec(
+                        *final_vol_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    vol_stdout, vol_stderr = await final_vol_process.communicate()
+                    
+                    # Log volume command output
+                    vol_stdout_str = vol_stdout.decode().strip()
+                    vol_stderr_str = vol_stderr.decode().strip()
+                    _LOGGER.debug(f"Volume command stdout: {vol_stdout_str}")
+                    _LOGGER.debug(f"Volume command stderr: {vol_stderr_str}")
+                    _LOGGER.debug(f"Volume command return code: {final_vol_process.returncode}")
+                
+                # Return success/failure based on status check
                 if status_check:
                     _LOGGER.info(f"Successfully cast to device at {ip}")
                     return True
