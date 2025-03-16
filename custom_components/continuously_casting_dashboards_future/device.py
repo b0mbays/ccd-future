@@ -37,7 +37,7 @@ class DeviceManager:
             _LOGGER.debug(f"Full scan output: {scan_output}")
             
             if process.returncode != 0:
-                _LOGGER.error(f"Catt scan failed: {stderr.decode().strip()}")
+                _LOGGER.warning(f"Catt scan failed: {stderr.decode().strip()}")
                 return None
             
             # Parse scan results and find exact matching device
@@ -71,11 +71,11 @@ class DeviceManager:
             
             # If we get here, no exact match was found
             found_names = [name for name, _ in found_devices]
-            _LOGGER.error(f"Device '{device_name}' not found in scan results. Found devices: {found_names}")
-            _LOGGER.error(f"Make sure the name matches exactly what appears in the scan output.")
+            _LOGGER.warning(f"Device '{device_name}' not found in scan results. Found devices: {found_names}")
+            _LOGGER.warning(f"Make sure the name matches exactly what appears in the scan output.")
             return None
         except Exception as e:
-            _LOGGER.error(f"Error scanning for devices: {str(e)}")
+            _LOGGER.warning(f"Error scanning for devices: {str(e)}")
             return None
 
     async def async_is_media_playing(self, ip):
@@ -150,7 +150,7 @@ class DeviceManager:
             _LOGGER.debug(f"No media playing on device at {ip}")
             return False
         except Exception as e:
-            _LOGGER.error(f"Error checking media status on device at {ip}: {str(e)}")
+            _LOGGER.warning(f"Error checking media status on device at {ip}: {str(e)}")
             return False
 
     async def async_check_device_status(self, ip):
@@ -207,7 +207,7 @@ class DeviceManager:
                 _LOGGER.warning(f"Status check failed with return code {process.returncode}: {stderr_str}")
                 return False
         except Exception as e:
-            _LOGGER.error(f"Error checking device status at {ip}: {str(e)}")
+            _LOGGER.warning(f"Error checking device status at {ip}: {str(e)}")
             return False
             
     def get_active_device(self, device_key):

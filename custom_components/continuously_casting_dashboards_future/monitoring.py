@@ -176,10 +176,31 @@ class MonitoringManager:
             device_key = f"{device_name}_{ip}"
                 
             for device_config in device_configs:
-                # Skip devices outside their time window
-                if not await self.time_window_checker.async_is_within_time_window(device_name, device_config):
-                    _LOGGER.debug(f"Outside casting time window for {device_name}, skipping check")
-                    continue
+                # Check if device is within casting time window
+                is_in_time_window = await self.time_window_checker.async_is_within_time_window(device_name, device_config)
+                
+                # First handle the case where the device is outside its casting time window
+                if not is_in_time_window:
+                    _LOGGER.debug(f"Outside casting time window for {device_name}, checking if dashboard is active to stop it")
+                    
+                    # Check if our dashboard is currently active
+                    is_casting = await self.device_manager.async_check_device_status(ip)
+                    
+                    if is_casting:
+                        _LOGGER.info(f"Device {device_name} is casting our dashboard outside allowed time window. Stopping cast.")
+                        await self.async_stop_casting(ip)
+                        
+                        # Update device status
+                        self.device_manager.update_active_device(
+                            device_key=device_key,
+                            status='stopped',
+                            last_checked=datetime.now().isoformat()
+                        )
+                    
+                    continue  # Skip to the next device/config
+                
+                # Handle device within its allowed time window below
+                _LOGGER.debug(f"Inside casting time window for {device_name}, continuing with normal checks")
                 
                 # Check if media is playing before attempting to reconnect
                 is_media_playing = await self.device_manager.async_is_media_playing(ip)
@@ -293,6 +314,36 @@ class MonitoringManager:
                         last_status_change=time.time(),
                         reconnect_attempts=0
                     )
+
+    async def async_stop_casting(self, ip):
+        """Stop casting on a device."""
+        try:
+            cmd = ['catt', '-d', ip, 'stop']
+            _LOGGER.debug(f"Executing stop command: {' '.join(cmd)}")
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            # Log the results
+            stdout_str = stdout.decode().strip()
+            stderr_str = stderr.decode().strip()
+            _LOGGER.debug(f"Stop command stdout: {stdout_str}")
+            _LOGGER.debug(f"Stop command stderr: {stderr_str}")
+            
+            if process.returncode == 0:
+                _LOGGER.info(f"Successfully stopped casting on device at {ip}")
+                return True
+            else:
+                _LOGGER.error(f"Failed to stop casting on device at {ip}: {stderr_str}")
+                return False
+                
+        except Exception as e:
+            _LOGGER.error(f"Error stopping casting on device at {ip}: {str(e)}")
+            return False
 
     async def async_reconnect_device(self, device_name, ip, device_config):
         """Attempt to reconnect a disconnected device."""
