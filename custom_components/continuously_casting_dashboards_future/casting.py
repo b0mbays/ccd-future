@@ -100,15 +100,25 @@ class CastingManager:
                 # Only set the volume after the status check confirms casting is successful
                 if status_check or cast_likely_succeeded:
                     # Determine the volume to set after casting:
-                    # 1. If config_volume is specified and not None, use it
+                    # 1. If config_volume is specified and not None, use it (multiplied by 10 to get percentage)
                     # 2. If no config_volume or it's None/unspecified, use the current_volume we detected
-                    final_volume = config_volume if config_volume is not None else current_volume
+                    if config_volume is not None:
+                        # Convert from scale of 1-10 to percentage (0-100)
+                        final_volume = int(config_volume * 10)
+                        _LOGGER.debug(f"Using config volume: {config_volume} (converted to {final_volume}%)")
+                    else:
+                        # Current volume from device is already in percentage
+                        final_volume = current_volume
+                        _LOGGER.debug(f"Using current volume from device: {final_volume}%")
                     
                     # Ensure we have a reasonable volume value
                     if final_volume is None or not isinstance(final_volume, (int, float)):
-                        final_volume = 5  # Default fallback
+                        final_volume = 50  # Default fallback (50%)
                     
-                    _LOGGER.debug(f"Setting final volume to {final_volume} for device at {ip}")
+                    # Make sure volume is within 0-100 range
+                    final_volume = max(0, min(100, final_volume))
+                    
+                    _LOGGER.debug(f"Setting final volume to {final_volume}% for device at {ip}")
                     final_vol_cmd = ['catt', '-d', ip, 'volume', str(final_volume)]
                     _LOGGER.debug(f"Executing final volume command: {' '.join(final_vol_cmd)}")
                     
@@ -165,7 +175,7 @@ class CastingManager:
             
             if process.returncode != 0:
                 _LOGGER.warning(f"Failed to get current volume for {ip}: {stderr.decode().strip()}")
-                return 5  # Default fallback
+                return 50  # Default fallback (50%)
                 
             status_output = stdout.decode().strip()
             _LOGGER.debug(f"Current status output: {status_output}")
@@ -176,16 +186,16 @@ class CastingManager:
                     try:
                         volume_str = line.split(":", 1)[1].strip()
                         volume = int(volume_str)
-                        _LOGGER.debug(f"Extracted current volume: {volume}")
+                        _LOGGER.debug(f"Extracted current volume: {volume}%")
                         return volume
                     except (ValueError, IndexError) as e:
                         _LOGGER.warning(f"Failed to parse volume from status: {e}")
-                        return 5  # Default fallback
+                        return 50  # Default fallback (50%)
             
             # If we didn't find volume info
             _LOGGER.warning(f"No volume information found in status output")
-            return 5  # Default fallback
+            return 50  # Default fallback (50%)
             
         except Exception as e:
             _LOGGER.error(f"Error getting current volume for {ip}: {str(e)}")
-            return 5  # Default fallback
+            return 50  # Default fallback (50%)
