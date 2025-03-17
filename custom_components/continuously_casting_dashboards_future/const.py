@@ -25,6 +25,7 @@ STATUS_DISCONNECTED = "disconnected"
 STATUS_MEDIA_PLAYING = "media_playing"
 STATUS_OTHER_CONTENT = "other_content"
 STATUS_UNKNOWN = "unknown"
+STATUS_STOPPED = "stopped"
 
 # Health stats event types
 EVENT_CONNECTION_ATTEMPT = "connection_attempt"
