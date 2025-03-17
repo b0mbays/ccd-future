@@ -227,3 +227,9 @@ class DeviceManager:
     def get_all_active_devices(self):
         """Get all active devices."""
         return self.active_devices
+        
+    def get_device_current_dashboard(self, device_key):
+        """Get the current dashboard URL for a device if it exists."""
+        if device_key in self.active_devices:
+            return self.active_devices[device_key].get('current_dashboard')
+        return None
